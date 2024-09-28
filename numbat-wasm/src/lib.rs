@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
 use numbat::buffered_writer::BufferedWriter;
-use numbat::commands::HelpKind;
+use numbat::command::HelpKind;
 use numbat::diagnostic::ErrorDiagnostic;
 use numbat::help::help_markup;
 use numbat::html_formatter::{HtmlFormatter, HtmlWriter};
