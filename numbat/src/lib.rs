@@ -170,6 +170,7 @@ impl Context {
             String,
             Option<String>,
             Option<String>,
+            Vec<(String, Option<String>)>,
             CodeSource,
         ),
     > + '_ {
@@ -187,6 +188,7 @@ impl Context {
                         .to_string(),
                     meta.description.clone(),
                     meta.url.clone(),
+                    meta.examples.clone(),
                     self.resolver
                         .get_code_source(signature.definition_span.code_source_id),
                 )
@@ -391,13 +393,13 @@ impl Context {
                             + m::text(" = ")
                             + m::value(prefix.factor().pretty_print())
                             + m::space()
-                            + m::unit(full_name.clone());
+                            + m::unit(full_name.to_string());
                     }
 
                     if let Some(BaseUnitAndFactor(prod, num)) = x {
                         help += m::nl()
                             + m::value("1 ")
-                            + m::unit(full_name.clone())
+                            + m::unit(full_name.to_string())
                             + m::text(" = ")
                             + m::value(num.pretty_print())
                             + m::space()
@@ -409,7 +411,8 @@ impl Context {
                                 Some(m::FormatType::Unit),
                             );
                     } else {
-                        help += m::nl() + m::unit(full_name.clone()) + m::text(" is a base unit");
+                        help +=
+                            m::nl() + m::unit(full_name.to_string()) + m::text(" is a base unit");
                     }
                 };
 
@@ -592,7 +595,7 @@ impl Context {
 
         let result = self
             .typechecker
-            .check(transformed_statements)
+            .check(&transformed_statements)
             .map_err(|err| NumbatError::TypeCheckError(*err));
 
         if result.is_err() {
