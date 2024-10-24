@@ -66,6 +66,152 @@ pub struct TypeChecker {
     constraints: ConstraintSet,
 }
 
+/// Mutable subset of [`TypeChecker`]'s fields needed for `proper_function_call`
+///
+/// The borrow checker cannot reason about which fields are mutated in a `&mut self`
+/// method, which can result in false positives of overlapping mutable borrows. To fix
+/// that, we split off only the fields we need to call `proper_function_call` into a
+/// separate type. Then the arguments passed to `proper_function_call`, some of which
+/// are borrowed from the typechecker's `env`, are provably distinct from those mutated
+/// by `proper_function_call`, and all is well.
+struct TypeCheckerMut<'a> {
+    registry: &'a DimensionRegistry,
+    name_generator: &'a mut NameGenerator,
+    constraints: &'a mut ConstraintSet,
+}
+
+impl<'a> TypeCheckerMut<'a> {
+    fn new(
+        registry: &'a DimensionRegistry,
+        name_generator: &'a mut NameGenerator,
+        constraints: &'a mut ConstraintSet,
+    ) -> Self {
+        Self {
+            registry,
+            name_generator,
+            constraints,
+        }
+    }
+
+    fn add_equal_constraint(&mut self, lhs: &Type, rhs: &Type) -> TrivialResolution {
+        self.constraints
+            .add(Constraint::Equal(lhs.clone(), rhs.clone()))
+    }
+
+    fn add_dtype_constraint(&mut self, type_: &Type) -> TrivialResolution {
+        self.constraints.add(Constraint::IsDType(type_.clone()))
+    }
+
+    fn proper_function_call<'b>(
+        &mut self,
+        span: &Span,
+        full_span: &Span,
+        function_name: &'b str,
+        signature: &FunctionSignature,
+        arguments: Vec<typed_ast::Expression<'b>>,
+        argument_types: Vec<Type>,
+    ) -> Result<typed_ast::Expression<'b>> {
+        let FunctionSignature {
+            name: _,
+            definition_span,
+            type_parameters: _,
+            parameters,
+            return_type_annotation: _,
+            fn_type,
+        } = signature;
+
+        let fn_type = match fn_type {
+            TypeScheme::Concrete(t) => {
+                // This branch is needed for recursive functions, where the type of the function
+                // is not yet known (and not yet quantified).
+                t.clone()
+            }
+            TypeScheme::Quantified(_, _) => {
+                let qt = fn_type.instantiate(self.name_generator);
+
+                for Bound::IsDim(t) in qt.bounds.iter() {
+                    self.add_dtype_constraint(t).ok();
+                }
+
+                qt.inner
+            }
+        };
+
+        let Type::Fn(parameter_types, return_type) = fn_type else {
+            unreachable!("Expected function type, got {:#?}", fn_type);
+        };
+
+        let arity_range = parameters.len()..=parameters.len();
+
+        if !arity_range.contains(&arguments.len()) {
+            return Err(Box::new(TypeCheckError::WrongArity {
+                callable_span: *span,
+                callable_name: function_name.to_owned(),
+                callable_definition_span: Some(*definition_span),
+                arity: arity_range,
+                num_args: arguments.len(),
+            }));
+        }
+
+        for (idx, ((parameter_span, parameter_type), argument_type)) in parameters
+            .iter()
+            .map(|p| p.0)
+            .zip(parameter_types.iter())
+            .zip(argument_types)
+            .enumerate()
+        {
+            if self
+                .add_equal_constraint(parameter_type, &argument_type)
+                .is_trivially_violated()
+            {
+                match (parameter_type, &argument_type) {
+                    (Type::Dimension(parameter_dtype), Type::Dimension(argument_dtype)) => {
+                        return Err(Box::new(TypeCheckError::IncompatibleDimensions(
+                            IncompatibleDimensionsError {
+                                span_operation: *span,
+                                operation: format_compact!(
+                                    "argument {num} of function call to '{name}'",
+                                    num = idx + 1,
+                                    name = function_name
+                                ),
+                                span_expected: parameter_span,
+                                expected_name: "parameter type",
+                                expected_dimensions: self.registry.get_derived_entry_names_for(
+                                    &parameter_dtype.to_base_representation(),
+                                ),
+                                expected_type: parameter_dtype.to_base_representation(),
+                                span_actual: arguments[idx].full_span(),
+                                actual_name: " argument type",
+                                actual_name_for_fix: "function argument",
+                                actual_dimensions: self.registry.get_derived_entry_names_for(
+                                    &argument_dtype.to_base_representation(),
+                                ),
+                                actual_type: argument_dtype.to_base_representation(),
+                            },
+                        )));
+                    }
+                    _ => {
+                        return Err(Box::new(TypeCheckError::IncompatibleTypesInFunctionCall(
+                            Some(parameter_span),
+                            parameter_type.clone(),
+                            arguments[idx].full_span(),
+                            argument_type.clone(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(typed_ast::Expression::FunctionCall(
+            *span,
+            *full_span,
+            function_name,
+            arguments,
+            TypeScheme::concrete(return_type.as_ref().clone()),
+        ))
+    }
+}
+
 struct ElaborationDefinitionArgs<'a, 'b> {
     identifier_span: Span,
     expr: &'b ast::Expression<'a>,
@@ -84,12 +230,21 @@ impl TypeChecker {
     }
 
     fn add_equal_constraint(&mut self, lhs: &Type, rhs: &Type) -> TrivialResolution {
-        self.constraints
-            .add(Constraint::Equal(lhs.clone(), rhs.clone()))
+        TypeCheckerMut::new(
+            &self.registry,
+            &mut self.name_generator,
+            &mut self.constraints,
+        )
+        .add_equal_constraint(lhs, rhs)
     }
 
     fn add_dtype_constraint(&mut self, type_: &Type) -> TrivialResolution {
-        self.constraints.add(Constraint::IsDType(type_.clone()))
+        TypeCheckerMut::new(
+            &self.registry,
+            &mut self.name_generator,
+            &mut self.constraints,
+        )
+        .add_dtype_constraint(type_)
     }
 
     fn enforce_dtype(&mut self, type_: &Type, span: Span) -> Result<()> {
@@ -172,128 +327,6 @@ impl TypeChecker {
             );
             TypeCheckError::UnknownIdentifier(span, name.into(), suggestion)
         })?)
-    }
-
-    fn get_proper_function_reference<'a>(
-        &self,
-        expr: &ast::Expression<'a>,
-    ) -> Option<(&'a str, &FunctionSignature)> {
-        match expr {
-            ast::Expression::Identifier(_, name) => self
-                .env
-                .get_function_info(name)
-                .map(|(signature, _)| (*name, signature)),
-            _ => None,
-        }
-    }
-
-    fn proper_function_call<'a>(
-        &mut self,
-        span: &Span,
-        full_span: &Span,
-        function_name: &'a str,
-        signature: &FunctionSignature,
-        arguments: Vec<typed_ast::Expression<'a>>,
-        argument_types: Vec<Type>,
-    ) -> Result<typed_ast::Expression<'a>> {
-        let FunctionSignature {
-            name: _,
-            definition_span,
-            type_parameters: _,
-            parameters,
-            return_type_annotation: _,
-            fn_type,
-        } = signature;
-
-        let fn_type = match fn_type {
-            TypeScheme::Concrete(t) => {
-                // This branch is needed for recursive functions, where the type of the function
-                // is not yet known (and not yet quantified).
-                t.clone()
-            }
-            TypeScheme::Quantified(_, _) => {
-                let qt = fn_type.instantiate(&mut self.name_generator);
-
-                for Bound::IsDim(t) in qt.bounds.iter() {
-                    self.add_dtype_constraint(t).ok();
-                }
-
-                qt.inner
-            }
-        };
-
-        let Type::Fn(parameter_types, return_type) = fn_type else {
-            unreachable!("Expected function type, got {:#?}", fn_type);
-        };
-
-        let arity_range = parameters.len()..=parameters.len();
-
-        if !arity_range.contains(&arguments.len()) {
-            return Err(Box::new(TypeCheckError::WrongArity {
-                callable_span: *span,
-                callable_name: function_name.to_owned(),
-                callable_definition_span: Some(*definition_span),
-                arity: arity_range,
-                num_args: arguments.len(),
-            }));
-        }
-
-        for (idx, ((parameter_span, parameter_type), argument_type)) in parameters
-            .iter()
-            .map(|p| p.0)
-            .zip(parameter_types.iter())
-            .zip(argument_types)
-            .enumerate()
-        {
-            if self
-                .add_equal_constraint(parameter_type, &argument_type)
-                .is_trivially_violated()
-            {
-                match (parameter_type, &argument_type) {
-                    (Type::Dimension(parameter_dtype), Type::Dimension(argument_dtype)) => {
-                        return Err(Box::new(TypeCheckError::IncompatibleDimensions(
-                            IncompatibleDimensionsError {
-                                span_operation: *span,
-                                operation: format_compact!(
-                                    "argument {num} of function call to '{name}'",
-                                    num = idx + 1,
-                                    name = function_name
-                                ),
-                                span_expected: parameter_span,
-                                expected_name: "parameter type",
-                                expected_dimensions: self.registry.get_derived_entry_names_for(
-                                    &parameter_dtype.to_base_representation(),
-                                ),
-                                expected_type: parameter_dtype.to_base_representation(),
-                                span_actual: arguments[idx].full_span(),
-                                actual_name: " argument type",
-                                actual_name_for_fix: "function argument",
-                                actual_dimensions: self.registry.get_derived_entry_names_for(
-                                    &argument_dtype.to_base_representation(),
-                                ),
-                                actual_type: argument_dtype.to_base_representation(),
-                            },
-                        )));
-                    }
-                    _ => {
-                        return Err(Box::new(TypeCheckError::IncompatibleTypesInFunctionCall(
-                            Some(parameter_span),
-                            parameter_type.clone(),
-                            arguments[idx].full_span(),
-                            argument_type.clone(),
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(typed_ast::Expression::FunctionCall(
-            *span,
-            *full_span,
-            function_name,
-            arguments,
-            TypeScheme::concrete(return_type.as_ref().clone()),
-        ))
     }
 
     fn elaborate_expression<'a>(
@@ -778,15 +811,17 @@ impl TypeChecker {
                 // to a (proper) function, or it can be an arbitrary complicated expression
                 // that evaluates to a function "pointer".
 
-                if let Some((name, signature)) = self.get_proper_function_reference(callable) {
-                    // TODO: there is probably a better way to get around borrowing issues here
-                    let signature = signature.clone();
-
-                    self.proper_function_call(
+                if let Some((name, signature)) = self.env.get_proper_function_reference(callable) {
+                    TypeCheckerMut::new(
+                        &self.registry,
+                        &mut self.name_generator,
+                        &mut self.constraints,
+                    )
+                    .proper_function_call(
                         span,
                         full_span,
                         name,
-                        &signature,
+                        signature,
                         arguments_checked,
                         argument_types,
                     )?
