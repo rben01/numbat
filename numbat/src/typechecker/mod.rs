@@ -29,6 +29,7 @@ use crate::type_variable::TypeVariable;
 use crate::typed_ast::{self, DType, DTypeFactor, Expression, StructInfo, Type};
 use crate::{decorator, ffi, suggestion};
 
+use compact_str::{format_compact, CompactString, ToCompactString};
 use const_evaluation::evaluate_const_expr;
 use constraints::{Constraint, ConstraintSet, ConstraintSolverError, TrivialResolution};
 use environment::{Environment, FunctionMetadata, FunctionSignature};
@@ -52,9 +53,134 @@ fn dtype(e: &Expression) -> Result<DType> {
     }
 }
 
+struct ProperFunctionCallArgs<'a, 'b> {
+    registry: &'b DimensionRegistry,
+    constraints: &'b mut ConstraintSet,
+    name_generator: &'b mut NameGenerator,
+    span: &'b Span,
+    full_span: &'b Span,
+    function_name: &'a str,
+    signature: &'b FunctionSignature,
+    arguments: Vec<typed_ast::Expression<'a>>,
+    argument_types: Vec<Type>,
+}
+
+fn proper_function_call<'a>(
+    ProperFunctionCallArgs {
+        registry,
+        constraints,
+        name_generator,
+        span,
+        full_span,
+        function_name,
+        signature,
+        arguments,
+        argument_types,
+    }: ProperFunctionCallArgs<'a, '_>,
+) -> Result<typed_ast::Expression<'a>> {
+    let FunctionSignature {
+        name: _,
+        definition_span,
+        type_parameters: _,
+        parameters,
+        return_type_annotation: _,
+        fn_type,
+    } = signature;
+
+    let fn_type = match fn_type {
+        TypeScheme::Concrete(t) => {
+            // This branch is needed for recursive functions, where the type of the function
+            // is not yet known (and not yet quantified).
+            t.clone()
+        }
+        TypeScheme::Quantified(_, _) => {
+            let qt = fn_type.instantiate(name_generator);
+
+            for Bound::IsDim(t) in qt.bounds.iter() {
+                constraints.add_dtype_constraint(t).ok();
+            }
+
+            qt.inner
+        }
+    };
+
+    let Type::Fn(parameter_types, return_type) = fn_type else {
+        unreachable!("Expected function type, got {:#?}", fn_type);
+    };
+
+    let arity_range = parameters.len()..=parameters.len();
+
+    if !arity_range.contains(&arguments.len()) {
+        return Err(Box::new(TypeCheckError::WrongArity {
+            callable_span: *span,
+            callable_name: function_name.to_owned(),
+            callable_definition_span: Some(*definition_span),
+            arity: arity_range,
+            num_args: arguments.len(),
+        }));
+    }
+
+    for (idx, ((parameter_span, parameter_type), argument_type)) in parameters
+        .iter()
+        .map(|p| p.0)
+        .zip(parameter_types.iter())
+        .zip(argument_types)
+        .enumerate()
+    {
+        if constraints
+            .add_equal_constraint(parameter_type, &argument_type)
+            .is_trivially_violated()
+        {
+            match (parameter_type, &argument_type) {
+                (Type::Dimension(parameter_dtype), Type::Dimension(argument_dtype)) => {
+                    return Err(Box::new(TypeCheckError::IncompatibleDimensions(
+                        IncompatibleDimensionsError {
+                            span_operation: *span,
+                            operation: format_compact!(
+                                "argument {num} of function call to '{name}'",
+                                num = idx + 1,
+                                name = function_name
+                            ),
+                            span_expected: parameter_span,
+                            expected_name: "parameter type",
+                            expected_dimensions: registry.get_derived_entry_names_for(
+                                &parameter_dtype.to_base_representation(),
+                            ),
+                            expected_type: parameter_dtype.to_base_representation(),
+                            span_actual: arguments[idx].full_span(),
+                            actual_name: " argument type",
+                            actual_name_for_fix: "function argument",
+                            actual_dimensions: registry.get_derived_entry_names_for(
+                                &argument_dtype.to_base_representation(),
+                            ),
+                            actual_type: argument_dtype.to_base_representation(),
+                        },
+                    )));
+                }
+                _ => {
+                    return Err(Box::new(TypeCheckError::IncompatibleTypesInFunctionCall(
+                        Some(parameter_span),
+                        parameter_type.clone(),
+                        arguments[idx].full_span(),
+                        argument_type.clone(),
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(typed_ast::Expression::FunctionCall(
+        *span,
+        *full_span,
+        function_name,
+        arguments,
+        TypeScheme::concrete(return_type.as_ref().clone()),
+    ))
+}
+
 #[derive(Clone, Default)]
 pub struct TypeChecker {
-    structs: HashMap<String, StructInfo>,
+    structs: HashMap<CompactString, StructInfo>,
     registry: DimensionRegistry,
 
     type_namespace: Namespace,
@@ -65,16 +191,16 @@ pub struct TypeChecker {
     constraints: ConstraintSet,
 }
 
-struct ElaborationDefinitionArgs<'a> {
+struct ElaborationDefinitionArgs<'a, 'b> {
     identifier_span: Span,
-    expr: &'a ast::Expression<'a>,
+    expr: &'b ast::Expression<'a>,
     type_annotation_span: Option<Span>,
-    type_annotation: Option<&'a TypeAnnotation>,
-    operation: &'a str,
+    type_annotation: Option<&'b TypeAnnotation>,
+    operation: &'b str,
     expected_name: &'static str,
     actual_name: &'static str,
     actual_name_for_fix: &'static str,
-    elaboration_kind: &'a str,
+    elaboration_kind: &'b str,
 }
 
 impl TypeChecker {
@@ -83,12 +209,11 @@ impl TypeChecker {
     }
 
     fn add_equal_constraint(&mut self, lhs: &Type, rhs: &Type) -> TrivialResolution {
-        self.constraints
-            .add(Constraint::Equal(lhs.clone(), rhs.clone()))
+        self.constraints.add_equal_constraint(lhs, rhs)
     }
 
     fn add_dtype_constraint(&mut self, type_: &Type) -> TrivialResolution {
-        self.constraints.add(Constraint::IsDType(type_.clone()))
+        self.constraints.add_dtype_constraint(type_)
     }
 
     fn enforce_dtype(&mut self, type_: &Type, span: Span) -> Result<()> {
@@ -118,14 +243,15 @@ impl TypeChecker {
                     }
                 }
 
-                let mut dtype: DType = self
+                let mut factors = self
                     .registry
                     .get_base_representation(dexpr)
-                    .map(|br| br.into())
-                    .map_err(TypeCheckError::RegistryError)?;
+                    .map(DType::from)
+                    .map_err(TypeCheckError::RegistryError)?
+                    .into_factors();
 
                 // Replace BaseDimension("D") with TVar("D") for all type parameters
-                for (factor, _) in dtype.factors.iter_mut() {
+                for (factor, _) in &mut factors {
                     *factor = match factor {
                         DTypeFactor::BaseDimension(ref n)
                             if self
@@ -140,7 +266,7 @@ impl TypeChecker {
                     }
                 }
 
-                Ok(Type::Dimension(dtype))
+                Ok(Type::Dimension(DType::from_factors(factors)))
             }
             TypeAnnotation::Bool(_) => Ok(Type::Boolean),
             TypeAnnotation::String(_) => Ok(Type::String),
@@ -172,129 +298,10 @@ impl TypeChecker {
         })?)
     }
 
-    fn get_proper_function_reference(
-        &self,
-        expr: &ast::Expression,
-    ) -> Option<(String, &FunctionSignature)> {
-        match expr {
-            ast::Expression::Identifier(_, name) => self
-                .env
-                .get_function_info(name)
-                .map(|(signature, _)| (name.to_string(), signature)),
-            _ => None,
-        }
-    }
-
-    fn proper_function_call(
+    fn elaborate_expression<'a>(
         &mut self,
-        span: &Span,
-        full_span: &Span,
-        function_name: &str,
-        signature: &FunctionSignature,
-        arguments: Vec<typed_ast::Expression>,
-        argument_types: Vec<Type>,
-    ) -> Result<typed_ast::Expression> {
-        let FunctionSignature {
-            name: _,
-            definition_span,
-            type_parameters: _,
-            parameters,
-            return_type_annotation: _,
-            fn_type,
-        } = signature;
-
-        let fn_type = match fn_type {
-            TypeScheme::Concrete(t) => {
-                // This branch is needed for recursive functions, where the type of the function
-                // is not yet known (and not yet quantified).
-                t.clone()
-            }
-            TypeScheme::Quantified(_, _) => {
-                let qt = fn_type.instantiate(&mut self.name_generator);
-
-                for Bound::IsDim(t) in qt.bounds.iter() {
-                    self.add_dtype_constraint(t).ok();
-                }
-
-                qt.inner
-            }
-        };
-
-        let Type::Fn(parameter_types, return_type) = fn_type else {
-            unreachable!("Expected function type, got {:#?}", fn_type);
-        };
-
-        let arity_range = parameters.len()..=parameters.len();
-
-        if !arity_range.contains(&arguments.len()) {
-            return Err(Box::new(TypeCheckError::WrongArity {
-                callable_span: *span,
-                callable_name: function_name.to_owned(),
-                callable_definition_span: Some(*definition_span),
-                arity: arity_range,
-                num_args: arguments.len(),
-            }));
-        }
-
-        for (idx, ((parameter_span, parameter_type), argument_type)) in parameters
-            .iter()
-            .map(|p| p.0)
-            .zip(parameter_types.iter())
-            .zip(argument_types)
-            .enumerate()
-        {
-            if self
-                .add_equal_constraint(parameter_type, &argument_type)
-                .is_trivially_violated()
-            {
-                match (parameter_type, &argument_type) {
-                    (Type::Dimension(parameter_dtype), Type::Dimension(argument_dtype)) => {
-                        return Err(Box::new(TypeCheckError::IncompatibleDimensions(
-                            IncompatibleDimensionsError {
-                                span_operation: *span,
-                                operation: format!(
-                                    "argument {num} of function call to '{name}'",
-                                    num = idx + 1,
-                                    name = function_name
-                                ),
-                                span_expected: parameter_span,
-                                expected_name: "parameter type",
-                                expected_dimensions: self.registry.get_derived_entry_names_for(
-                                    &parameter_dtype.to_base_representation(),
-                                ),
-                                expected_type: parameter_dtype.to_base_representation(),
-                                span_actual: arguments[idx].full_span(),
-                                actual_name: " argument type",
-                                actual_name_for_fix: "function argument",
-                                actual_dimensions: self.registry.get_derived_entry_names_for(
-                                    &argument_dtype.to_base_representation(),
-                                ),
-                                actual_type: argument_dtype.to_base_representation(),
-                            },
-                        )));
-                    }
-                    _ => {
-                        return Err(Box::new(TypeCheckError::IncompatibleTypesInFunctionCall(
-                            Some(parameter_span),
-                            parameter_type.clone(),
-                            arguments[idx].full_span(),
-                            argument_type.clone(),
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(typed_ast::Expression::FunctionCall(
-            *span,
-            *full_span,
-            function_name.into(),
-            arguments,
-            TypeScheme::concrete(return_type.as_ref().clone()),
-        ))
-    }
-
-    fn elaborate_expression(&mut self, ast: &ast::Expression) -> Result<typed_ast::Expression> {
+        ast: &ast::Expression<'a>,
+    ) -> Result<typed_ast::Expression<'a>> {
         Ok(match ast {
             ast::Expression::Scalar(span, n)
                 if n.to_f64().is_zero() || n.to_f64().is_infinite() || n.to_f64().is_nan() =>
@@ -325,7 +332,7 @@ impl TypeChecker {
                     }
                 };
 
-                typed_ast::Expression::Identifier(*span, name.to_string(), TypeScheme::concrete(ty))
+                typed_ast::Expression::Identifier(*span, name, TypeScheme::concrete(ty))
             }
             ast::Expression::UnitIdentifier(span, prefix, name, full_name) => {
                 let type_scheme = self.identifier_type(*span, name)?.clone();
@@ -773,18 +780,20 @@ impl TypeChecker {
                 // to a (proper) function, or it can be an arbitrary complicated expression
                 // that evaluates to a function "pointer".
 
-                if let Some((name, signature)) = self.get_proper_function_reference(callable) {
-                    // TODO: there is probably a better way to get around borrowing issues here
-                    let signature = signature.clone();
-
-                    self.proper_function_call(
+                if let Some((function_name, signature)) =
+                    self.env.get_proper_function_reference(callable)
+                {
+                    proper_function_call(ProperFunctionCallArgs {
+                        registry: &mut self.registry,
+                        constraints: &mut self.constraints,
+                        name_generator: &mut self.name_generator,
                         span,
                         full_span,
-                        &name,
-                        &signature,
-                        arguments_checked,
+                        function_name,
+                        signature,
+                        arguments: arguments_checked,
                         argument_types,
-                    )?
+                    })?
                 } else {
                     let callable_checked = self.elaborate_expression(callable)?;
                     let callable_type = callable_checked.get_type();
@@ -880,7 +889,7 @@ impl TypeChecker {
                             format_specifiers,
                         } => Ok(typed_ast::StringPart::Interpolation {
                             span: *span,
-                            format_specifiers: format_specifiers.clone(),
+                            format_specifiers: format_specifiers.as_ref().copied(),
                             expr: Box::new(self.elaborate_expression(expr)?),
                         }),
                     })
@@ -933,7 +942,7 @@ impl TypeChecker {
                 let name = *name;
                 let fields_checked = fields
                     .iter()
-                    .map(|(_, n, v)| Ok((n.to_string(), self.elaborate_expression(v)?)))
+                    .map(|(_, n, v)| Ok((*n, self.elaborate_expression(v)?)))
                     .collect::<Result<Vec<_>>>()?;
 
                 let Some(struct_info) = self.structs.get(name).cloned() else {
@@ -958,13 +967,13 @@ impl TypeChecker {
                         ));
                     }
 
-                    let Some((expected_field_span, expected_type)) = struct_info.fields.get(field)
+                    let Some((expected_field_span, expected_type)) = struct_info.fields.get(*field)
                     else {
                         return Err(Box::new(TypeCheckError::UnknownFieldInStructInstantiation(
                             *span,
                             struct_info.definition_span,
-                            field.clone(),
-                            struct_info.name.clone(),
+                            field.to_string(),
+                            struct_info.name.to_string(),
                         )));
                     };
 
@@ -986,7 +995,7 @@ impl TypeChecker {
 
                 let missing_fields = {
                     let mut fields = struct_info.fields.clone();
-                    fields.retain(|f, _| !seen_fields.contains_key(f));
+                    fields.retain(|f, _| !seen_fields.contains_key(&f.as_str()));
                     fields.into_iter().map(|(n, (_, t))| (n, t)).collect_vec()
                 };
 
@@ -1038,7 +1047,7 @@ impl TypeChecker {
                     self.constraints
                         .add(Constraint::HasField(
                             type_.clone(),
-                            field_name.to_owned(),
+                            field_name.to_compact_string(),
                             field_type.clone(),
                         ))
                         .ok();
@@ -1050,7 +1059,7 @@ impl TypeChecker {
                     *ident_span,
                     *full_span,
                     Box::new(expr_checked),
-                    field_name.to_owned(),
+                    field_name,
                     TypeScheme::concrete(type_),
                     TypeScheme::concrete(field_type),
                 )
@@ -1105,10 +1114,10 @@ impl TypeChecker {
         })
     }
 
-    fn _elaborate_inner(
+    fn _elaborate_inner<'a>(
         &mut self,
-        definition: ElaborationDefinitionArgs,
-    ) -> Result<(typed_ast::Expression, typed_ast::Type)> {
+        definition: ElaborationDefinitionArgs<'a, '_>,
+    ) -> Result<(typed_ast::Expression<'a>, typed_ast::Type)> {
         let ElaborationDefinitionArgs {
             identifier_span,
             expr,
@@ -1203,7 +1212,7 @@ impl TypeChecker {
 
         for (name, _) in decorator::name_and_aliases(identifier, decorators) {
             self.env.add(
-                name.to_owned(),
+                name.to_compact_string(),
                 type_deduced.clone(),
                 *identifier_span,
                 false,
@@ -1211,16 +1220,16 @@ impl TypeChecker {
 
             self.value_namespace
                 .add_identifier_allow_override(
-                    name.to_owned(),
+                    name.to_compact_string(),
                     *identifier_span,
-                    "constant".to_owned(),
+                    CompactString::const_new("constant"),
                 )
                 .map_err(|err| Box::new(err.into()))?;
         }
 
         Ok(typed_ast::DefineVariable(
-            identifier.to_string(),
-            decorators.to_owned(),
+            identifier,
+            decorators.clone(),
             expr_checked,
             type_annotation.clone(),
             TypeScheme::concrete(type_deduced),
@@ -1276,7 +1285,7 @@ impl TypeChecker {
                 };
                 for (name, _) in decorator::name_and_aliases(unit_name, decorators) {
                     self.env.add(
-                        name.to_string(),
+                        name.to_compact_string(),
                         Type::Dimension(type_specified.clone()),
                         *span,
                         true,
@@ -1284,7 +1293,7 @@ impl TypeChecker {
                 }
 
                 typed_ast::Statement::DefineBaseUnit(
-                    unit_name.to_string(),
+                    unit_name,
                     decorators.clone(),
                     type_annotation.clone().map(TypeAnnotation::TypeExpression),
                     TypeScheme::concrete(Type::Dimension(type_specified)),
@@ -1313,14 +1322,14 @@ impl TypeChecker {
 
                 for (name, _) in decorator::name_and_aliases(identifier, decorators) {
                     self.env.add(
-                        name.to_string(),
+                        name.to_compact_string(),
                         type_deduced.clone(),
                         *identifier_span,
                         true,
                     );
                 }
                 typed_ast::Statement::DefineDerivedUnit(
-                    identifier.to_string(),
+                    identifier,
                     expr_checked,
                     decorators.clone(),
                     type_annotation.clone(),
@@ -1341,17 +1350,17 @@ impl TypeChecker {
                 if body.is_none() {
                     self.value_namespace
                         .add_identifier(
-                            function_name.to_string(),
+                            function_name.to_compact_string(),
                             *function_name_span,
-                            "foreign function".to_owned(),
+                            CompactString::const_new("foreign function"),
                         )
                         .map_err(|err| Box::new(err.into()))?;
                 } else {
                     self.value_namespace
                         .add_identifier_allow_override(
-                            function_name.to_string(),
+                            function_name.to_compact_string(),
                             *function_name_span,
-                            "function".to_owned(),
+                            CompactString::const_new("function"),
                         )
                         .map_err(|err| Box::new(err.into()))?;
                 }
@@ -1374,22 +1383,24 @@ impl TypeChecker {
 
                     self.type_namespace
                         .add_identifier(
-                            type_parameter.to_string(),
+                            type_parameter.to_compact_string(),
                             *span,
-                            "type parameter".to_owned(),
+                            CompactString::const_new("type parameter"),
                         )
                         .ok(); // TODO: is this call even correct?
 
                     self.registry.introduced_type_parameters.push((
                         *span,
-                        type_parameter.to_string(),
+                        type_parameter.to_compact_string(),
                         bound.clone(),
                     ));
 
                     match bound {
                         Some(TypeParameterBound::Dim) => {
-                            self.add_dtype_constraint(&Type::TPar(type_parameter.to_string()))
-                                .ok();
+                            self.add_dtype_constraint(&Type::TPar(
+                                type_parameter.to_compact_string(),
+                            ))
+                            .ok();
                         }
                         None => {}
                     }
@@ -1417,14 +1428,14 @@ impl TypeChecker {
                     }
 
                     self.env.add_scheme(
-                        parameter.to_string(),
+                        parameter.to_compact_string(),
                         TypeScheme::make_quantified(parameter_type.clone()),
                         *parameter_span,
                         false,
                     );
                     typed_parameters.push((
                         *parameter_span,
-                        parameter.to_string(),
+                        *parameter,
                         parameter_type,
                         type_annotation,
                     ));
@@ -1444,7 +1455,7 @@ impl TypeChecker {
 
                 let parameters: Vec<_> = typed_parameters
                     .iter()
-                    .map(|(span, name, _, annotation)| (*span, name.clone(), (*annotation).clone()))
+                    .map(|(span, name, _, annotation)| (*span, name, (*annotation).clone()))
                     .collect();
                 let parameter_types = typed_parameters
                     .iter()
@@ -1455,22 +1466,28 @@ impl TypeChecker {
                     TypeScheme::Concrete(Type::Fn(parameter_types, Box::new(return_type.clone())));
 
                 self.env.add_function(
-                    function_name.to_string(),
+                    function_name.to_compact_string(),
                     FunctionSignature {
-                        name: function_name.to_string(),
+                        name: function_name.to_compact_string(),
                         definition_span: *function_name_span,
                         type_parameters: type_parameters
                             .iter()
-                            .map(|(span, name, tpb)| (*span, name.to_string(), tpb.clone()).clone())
+                            .map(|(span, name, tpb)| {
+                                (*span, name.to_compact_string(), tpb.clone()).clone()
+                            })
                             .collect(),
-                        parameters,
+                        parameters: parameters
+                            .into_iter()
+                            .map(|(span, s, o)| (span, s.to_compact_string(), o))
+                            .collect(),
                         return_type_annotation: return_type_annotation.clone(),
                         fn_type: fn_type.clone(),
                     },
                     FunctionMetadata {
-                        name: crate::decorator::name(decorators).map(ToOwned::to_owned),
-                        url: crate::decorator::url(decorators).map(ToOwned::to_owned),
+                        name: crate::decorator::name(decorators).map(CompactString::from),
+                        url: crate::decorator::url(decorators).map(CompactString::from),
                         description: crate::decorator::description(decorators),
+                        examples: crate::decorator::examples(decorators),
                     },
                 );
 
@@ -1573,24 +1590,24 @@ impl TypeChecker {
                 self.type_namespace.restore();
                 self.env.restore();
                 self.env.add_function(
-                    function_name.to_string(),
+                    function_name.to_compact_string(),
                     signature.clone(),
                     metadata.clone(),
                 );
 
                 typed_ast::Statement::DefineFunction(
-                    function_name.to_string(),
+                    function_name,
                     decorators.clone(),
                     type_parameters
                         .iter()
-                        .map(|(_, name, bound)| (name.to_string(), bound.clone()))
+                        .map(|(_, name, bound)| (*name, bound.clone()))
                         .collect(),
                     typed_parameters
                         .iter()
                         .map(|(span, name, _, type_annotation)| {
                             (
                                 *span,
-                                name.clone(),
+                                *name,
                                 (*type_annotation).clone(),
                                 crate::markup::empty(),
                             )
@@ -1605,7 +1622,11 @@ impl TypeChecker {
             }
             ast::Statement::DefineDimension(name_span, name, dexprs) => {
                 self.type_namespace
-                    .add_identifier(name.to_string(), *name_span, "dimension".to_owned())
+                    .add_identifier(
+                        name.to_compact_string(),
+                        *name_span,
+                        CompactString::const_new("dimension"),
+                    )
                     .map_err(|err| Box::new(err.into()))?;
 
                 if let Some(dexpr) = dexprs.first() {
@@ -1640,7 +1661,7 @@ impl TypeChecker {
                         .add_base_dimension(name)
                         .map_err(TypeCheckError::RegistryError)?;
                 }
-                typed_ast::Statement::DefineDimension(name.to_string(), dexprs.clone())
+                typed_ast::Statement::DefineDimension(name, dexprs.clone())
             }
             ast::Statement::ProcedureCall(span, kind @ ProcedureKind::Type, args) => {
                 if args.len() != 1 {
@@ -1739,9 +1760,9 @@ impl TypeChecker {
             } => {
                 self.type_namespace
                     .add_identifier(
-                        struct_name.to_string(),
+                        struct_name.to_compact_string(),
                         *struct_name_span,
-                        "struct".to_owned(),
+                        CompactString::const_new("struct"),
                     )
                     .map_err(|err| Box::new(err.into()))?;
 
@@ -1761,16 +1782,19 @@ impl TypeChecker {
 
                 let struct_info = StructInfo {
                     definition_span: *struct_name_span,
-                    name: struct_name.to_string(),
+                    name: struct_name.to_compact_string(),
                     fields: fields
                         .iter()
                         .map(|(span, name, type_)| {
-                            Ok((name.to_string(), (*span, self.type_from_annotation(type_)?)))
+                            Ok((
+                                name.to_compact_string(),
+                                (*span, self.type_from_annotation(type_)?),
+                            ))
                         })
                         .collect::<Result<_>>()?,
                 };
                 self.structs
-                    .insert(struct_name.to_string(), struct_info.clone());
+                    .insert(struct_name.to_compact_string(), struct_info.clone());
 
                 typed_ast::Statement::DefineStruct(struct_info)
             }
@@ -1883,8 +1907,7 @@ impl TypeChecker {
                     .iter_relevant_matches()
                     .filter(|(_, t)| t == &type_of_hole)
                     .take(10)
-                    .map(|(n, _)| n)
-                    .cloned()
+                    .map(|(n, _)| n.to_string())
                     .collect(),
             )));
         }
@@ -1894,12 +1917,12 @@ impl TypeChecker {
 
     pub fn check<'a>(
         &mut self,
-        statements: impl IntoIterator<Item = ast::Statement<'a>>,
+        statements: &[ast::Statement<'a>],
     ) -> Result<Vec<typed_ast::Statement<'a>>> {
         let mut checked_statements = vec![];
 
-        for statement in statements.into_iter() {
-            checked_statements.push(self.check_statement(&statement)?);
+        for statement in statements {
+            checked_statements.push(self.check_statement(statement)?);
         }
 
         Ok(checked_statements)
